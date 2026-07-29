@@ -168,3 +168,7 @@ demo_out/
 data/AniMer*/
 data/backbone.pth
 logs/
+media/
+
+# Others
+*.pkl
