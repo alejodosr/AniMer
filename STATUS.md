@@ -152,6 +152,15 @@ pixels changed it by 1%).
 animal closer.** Camera at 2 m with the animal at 3 m gives ~1.5× instead of
 4.9× — better than three times less error, for free.
 
+*Update (see "Camera-generic path" below): the synthetic harness confirmed
+this error model exactly — baseline floor error is 9.3 cm per unit of d/h,
+correlation 0.98 — and the joint-placement path cuts the slope to 1.1 cm per
+unit, with the d/h dependence shown to enter almost entirely through the
+SCALE fit, not the placement. On the harness, raising the camera is no longer
+the limiting factor. On real clips this is so far only proven for the
+across-view clip (dog_1); the along-view clips still lose to the baseline at
+the retargeter (details below).*
+
 After that, an independent 2D paw detector. Not because it would be more
 precise per frame, but because its errors would be *independent* of the
 whole-body mesh fit, which is what we currently lack.
@@ -209,13 +218,132 @@ intermediates between runs.
 
 ---
 
+## Camera-generic path (PLAN.md, 2026-07-29)
+
+New files, existing pipeline untouched: `synth_harness.py` + `synth_eval.py`
+(Phase 0), `contacts_kine.py` (Phase 1), `world_place_ba.py` (Phase 2/3).
+
+**Harness** (dog_1's recovered motion re-filmed from 12 synthetic cameras,
+heights 0.8–2.2 m × distances 2–6 m, exact ground truth, shared noise
+realization of 3.7 cm median paw error):
+
+| metric, across d/h 0.9–7.5 | baseline | joint (BA) |
+|---|---|---|
+| stance-toe floor error slope | 9.3 cm per unit d/h (corr .98) | **1.1 cm per unit** |
+| worst-geometry toe error | 0.66 m | **0.13 m** |
+| fitted scale error | −4% … **+184%** | −12% … +1% |
+| traverse ratio | 0.8 … **5.8×** | 0.90 … 0.99 |
+| contact F1 (vs declared GT) | 0.25–0.32, geometry-dependent | **0.61–0.62, flat** |
+
+The single most important measurement: with TRUE scale supplied, the
+baseline's floor error is nearly flat in d/h — the amplification enters
+almost entirely through the paw-spread scale fit. Fixing scale fixes most of
+the camera-height sensitivity.
+
+**Contacts** (`contacts_kine.py`): votes over forward-relative toe velocity
+(the strong signal — stance is backward relative motion at ~walking speed,
+against 2–5 cm noise), body-frame toe height, and pixel speed. ONE set of
+constants lands biomechanically plausible duty on all three real clips
+(dog_1 walking 0.67, cat_1 0.66, dog_2 0.63) where the floor-speed detector
+needed per-clip thresholds and left 41% of walking frames with zero feet.
+
+**Real clips through the unmodified retargeter** (clamp / skate m/s after):
+
+| clip | baseline | BA path |
+|---|---|---|
+| dog_1 (across-view) | 0.06% / 0.000 | 0.61% / 0.006 ✓ |
+| cat_1 (along-view) | 0.08% / 0.003 | **10.4% / 0.081 ✗** |
+| dog_2 (along-view) | 1.78% / 0.031 | **7.3% / 0.102 ✗** |
+
+The along-view regression was debugged to three causes; two are fixed, one
+is structural (numbers after fixes: cat 10.4→7.2%, dog_2 ~8%, dog_1 0.6%):
+1. **Over-merged stance runs + unconditional pinning** — the kinematic
+   detector merges footfalls on slow gaits, so one anchor stood for real toe
+   travel and pinning stretched emitted legs to 1.05× their own FK length
+   (p99). Fixed: runs split at 0.25 leg-lengths of floor travel
+   (`--split-budget`), and runs whose pin correction exceeds 0.12 leg-lengths
+   are left on FK (`--max-pin-frac`).
+2. **Body floating off its planted feet** — the stiff hinge, depth cue and
+   smoothness out-voted the stance tie (stance-toe z p90 was 6.8 cm). Fixed:
+   stance-z tie 4 cm → 1.5 cm (`--sigma-fkz`), hinge softened to 3 cm.
+3. **Structural, unfixed**: the BA motion is SMOOTH, so animal2go2's initial
+   contact gate (z < 3 cm AND speed < 0.25 m/s) accepts ~90% of frames as
+   stance — arguably correct for a milling cat — and `pin_stance_feet` then
+   holds each foot at one spot for seconds, integrating our residual
+   trunk-vs-anchor drift (~0.05 m/s) into leg stretch. The baseline evades
+   this only because its jittery feet FAIL the speed gate, keeping pin spans
+   short. The retargeter's constants are implicitly co-tuned with the
+   baseline's noise; fixing it properly means revisiting them at migration
+   time (animal2go2 is read-only until then), or eliminating the residual
+   drift, which needs the independent paw detector. Injecting jitter to game
+   the gate was considered and rejected (the motionless-robot trap, inverted).
+
+Until then, **the baseline remains the production path for along-view
+clips**; the BA path wins wherever truth is measurable (harness) and on
+across-view footage. (`--falsify-z` exists to drop solver-contradicted
+stance samples; measured harmful — freed toes stay slow-and-low and get
+pinned anyway, now unanchored — so it defaults off.)
+
+**Scale, three estimators** (`world_place_ba.py` prints all three):
+- *lateral-anchor* — pair separations of ray-only stance anchors projected on
+  the image-lateral direction, where the homography is amplification-free.
+  Unbiased to −12…+1% on the harness at every camera. Needs lateral
+  information: an along-view walk leaves only the ~0.1-unit left-right paw
+  spacing and it degenerates (info 114 on dog_1 vs 19–33 on dog_2/cat_1).
+- *floor-spread* (the baseline fit) — inherits the full d/h amplification:
+  +185% on dog_2's 4.9× geometry, exactly as the harness predicted.
+- *depth cue* (AniMer's `cam_t` apparent size) — **precise but biased**:
+  1% relative std over dog_1's standing segment, +35% absolute (arbitrated
+  against the standing-segment floor truth of 0.877 m/unit). A stability
+  check alone would have blessed it; it is used only as RELATIVE depth, with
+  a per-clip bias factor estimated under a weak prior.
+  Policy: lateral-anchor when its information is sufficient, else the median
+  of the three. The honest error bar on along-view absolute scale is ±20%
+  until the independent 2D paw detector exists.
+
+### New traps
+
+**`cam_t` pairs with the RAW FK frame, not the root-centred one.** The raw
+SMAL root sits ~0.3 units from the origin and raw FK transforms as
+R@(x−j0)+j0. Fabricating observations with the wrong convention shifted the
+whole world by a constant 0.31 m — laterally, so it looked like a mystery
+bias, not a frame error.
+
+**The retargeter names its output from the npz `source` field, not the
+filename.** Feeding it an experiment npz with `source=dog_2` silently
+overwrites `motions/dog_2.pkl`. Pass `--source <name>_ba` to parse_video for
+any experimental branch. (All three baseline pkls were regenerated from the
+baseline processed npz after learning this.)
+
+**Scale must not be a least-squares variable.** Every residual it multiplies
+also multiplies the FK noise, so the optimizer shrinks the animal to shrink
+the noise: a stable −8…−25% (errors-in-variables attenuation, worsened by the
+Huber knee). Estimate scale outside the LS from time-averaged geometry.
+
 ## Not done
 
-- Independent 2D paw detector (the measurement to justify it is specified above).
-- Synthetic harness with exact ground truth. AniMer recovers a pose it
-  generated to 3.6% of body length, so a rendered-mesh harness *is* viable —
-  the earlier objection was based on stick-figure renders and is withdrawn.
+- Independent 2D paw detector (the measurement to justify it is specified
+  above; the along-view scale ambiguity now makes it the top item).
+- The along-view body-height regression at the retargeter (see above) — the
+  one thing blocking the BA path from replacing the baseline outright.
+- ~~Full-AniMer runs on the harness renders~~ DONE (2026-07-29). On
+  `cfg_h0.8_d4` (82.9% detection): real pose error is 8.4 cm median after
+  scale normalization vs the injected 3.8 cm — the harness was ~2×
+  optimistic FOR RENDERED APPEARANCE (the render is out-of-domain: beta
+  wobble 17.8% vs 2.1% on real footage; real-footage pose error remains the
+  measured 2-5 cm). Error is 91% below 3 Hz — the band-limited drift model
+  is right in character. The depth cue overestimates depth on the render by
+  the same ~40% as on real dog_1 (bias 0.71 vs 0.74) — same DIRECTION in
+  both domains, but the solver-fitted bias on cat/dog_2 is ~0.93-0.96, so
+  the bias varies per clip/animal and the cue stays relative-only. Fully
+  real end-to-end at amp 5.0: lateral-anchor scale within 4% of truth
+  (floor-spread would have been +93%), root error 16 cm, traverse ratio
+  1.37 (inflated by the 17% detection gaps). `cfg_h2.2_d2` unusable — the
+  DETECTOR finds the rendered dog in only 19% of frames from the high
+  viewpoint; a more realistic render (texture/fur) is the fix.
+- Per-frame root uncertainty from the solver Jacobian into the `.video.json`
+  sidecar (PLAN.md Phase 4).
 - Migration into `animal2go2` proper. Deliberate: it stays untouched until
   this path is trusted.
 - The last 2.5 s of dog_1 (dog turns away, 52% of frames unanchored) is
-  carried but weak; `--trim 0,660` drops it.
+  carried but weak; `--trim 0,660` drops it (the BA runs use it).
