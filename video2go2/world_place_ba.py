@@ -92,6 +92,12 @@ def main():
                         "factor; monocular absolute depth is not trusted")
     p.add_argument("--no-depth-cue", action="store_true")
     p.add_argument("--floor-tol", type=float, default=0.02)
+    p.add_argument("--size-prior", type=float, default=0.50,
+                   help="prior mean shoulder height in metres for a dog "
+                        "(0 disables). Generic, not per-clip.")
+    p.add_argument("--size-sigma", type=float, default=0.30,
+                   help="log-space width of the size prior; 0.30 spans "
+                        "roughly 27-90 cm at one sigma")
     p.add_argument("--min-lat-info", type=float, default=60.0,
                    help="frames*units^2 of lateral stance information below "
                         "which the lateral-anchor scale is not trusted")
@@ -371,17 +377,42 @@ def main():
     spread_u = float(np.median(np.linalg.norm(
         paws_u.max(axis=1) - paws_u.min(axis=1), axis=-1)))
     s_spread = body_m / max(spread_u, 1e-9)
-    use_lat = s_hat is not None and s_hat > 0 and lat_info >= args.min_lat_info
-    if use_lat:
-        s = s_hat
-    else:
-        # no single fallback survives every clip: floor-spread inherits the
-        # d/h amplification (dog_2: 3.26 vs a plausible ~1.2), the depth cue
-        # is precise-but-biased. The median of the three tolerates one
-        # arbitrarily wrong member.
-        cand = [v for v in (s_hat, s_spread, s0) if v and v > 0]
-        s = float(np.median(cand))
-    s = float(np.clip(s, 0.2, 4.0))
+    # ---- scale as a 1-D MAP in log space --------------------------------
+    # Three estimators that disagree (dog_2: 1.17 / 3.08 / 1.27) plus a weak
+    # BIOLOGICAL prior. The prior is what humans get for free — a person is
+    # 1.7 m +/- 10%, which is why their pipelines need no floor. A dog is
+    # 25-75 cm, far broader, but broad still beats a 3x disagreement, and it
+    # is generic: no fine-tuning, no per-clip tuning, true of any dog.
+    #
+    # It also arbitrates between CALIBRATIONS: on dog_2 a ZoeDepth-derived
+    # plane implies a 40 cm shoulder for an obviously large retriever, and
+    # the prior rejects it; on dog_1 every calibration implies ~54 cm and the
+    # prior stays silent. Sigmas come from measured behaviour: lateral-anchor
+    # was -12%..+1% on the harness, floor-spread +17%..+184%, and the depth
+    # cue carried a +35% bias on dog_1.
+    shoulder_u = float(np.median(pl_w[:, 2:6, 2] - pl_w[:, TOE0:TOE0 + 4, 2]))
+    obs = []
+    if s_hat and s_hat > 0:
+        obs.append((np.log(s_hat),
+                    0.08 * np.sqrt(max(args.min_lat_info * 2.0, 1.0)
+                                   / max(lat_info, 1.0))))
+    if s_spread > 0:
+        obs.append((np.log(s_spread), 0.60))
+    if s0 > 0:
+        obs.append((np.log(s0), 0.35))
+    if args.size_prior > 0 and shoulder_u > 1e-6:
+        obs.append((np.log(args.size_prior / shoulder_u), args.size_sigma))
+    num = sum(m / sg ** 2 for m, sg in obs)
+    den = sum(1.0 / sg ** 2 for m, sg in obs)
+    s = float(np.clip(np.exp(num / den), 0.2, 4.0))
+    print("scale MAP inputs (log-space mean +/- sigma):")
+    for (m, sg), nm in zip(obs, ["lateral-anchor", "floor-spread", "depth-cue",
+                                 "size-prior"][:len(obs)]):
+        print(f"    {nm:<15} {np.exp(m):6.3f}  sigma {sg:.2f}"
+              f"   -> shoulder {np.exp(m) * shoulder_u * 100:5.1f} cm")
+    print(f"    MAP            {s:6.3f}         "
+          f"   -> shoulder {s * shoulder_u * 100:5.1f} cm"
+          f"   (lateral info {lat_info:.0f})")
     res = least_squares(residuals, x0, args=(s,), jac_sparsity=Jsp,
                         method="trf", loss="huber", f_scale=2.5,
                         max_nfev=120, verbose=2 if args.verbose else 0)
@@ -410,11 +441,7 @@ def main():
         T = A @ kn
     print(f"solver: {res.status} ({res.nfev} evals), "
           f"cost {0.5 * (r0 ** 2).sum():.0f} -> {res.cost:.0f}")
-    print(f"scale: lateral-anchor {s_hat if s_hat else float('nan'):.4f} "
-          f"(info {lat_info:.0f}), floor-spread {s_spread:.4f}, depth-cue "
-          f"{s0:.4f} -> using "
-          f"{'lateral-anchor' if use_lat else 'median-fallback'}"
-          f" {s:.4f} m/unit   depth-cue bias {bd:.3f}")
+    print(f"scale: {s:.4f} m/unit   depth-cue bias {bd:.3f}")
 
     world = s * pl_w + T[:, None, :]
     # Pin stance toes to their anchors in the OUTPUT as well, crossfaded a

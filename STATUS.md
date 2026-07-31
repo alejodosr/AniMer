@@ -8,6 +8,37 @@ produces a file that its unmodified Milestone 1 pipeline consumes.
 
 ---
 
+## DEFAULT PIPELINE (2026-07-31) — no manual ground calibration
+
+`video2go2/run_default.sh <video> <clip> [trim]`
+
+    AniMer pose -> DLC 2D skeleton -> [pose refinement] -> ZoeDepth ground
+    plane -> contacts_kine -> world_place_ba (--size-prior 0) -> parse_video
+
+The clicked four-point calibration is NO LONGER used. The ground plane comes
+from ZoeDepth metric depth, which removes both the interactive step and the
+tile-size assumption that made the old metres provisional. Scale carries no
+biological prior (ablation: 6-18% of the weight, <=4.6% effect, all sigmas
+hand-asserted).
+
+Default outputs under `v2go2/default/`, side-by-sides
+`paw/work/videos/DEFAULT_sbs_*.mp4`:
+
+| clip | scale | shoulder | traverse | clamp | skate after |
+|---|---|---|---|---|---|
+| dog_1 | 1.091 | 54.2 cm | 4.74 m | 1.45% | 0.020 |
+| dog_2 | 0.753 | 40.6 cm | 4.22 m | 5.56% | 0.097 |
+| cat_1 | 0.556 | 38.9 cm | 2.33 m | 7.35% | 0.062 |
+
+Known limitation carried deliberately: on dog_2 (Veo-generated) the depth
+plane implies a 40.6 cm dog, 65% below the clicked calibration. Depth models
+have no real geometry to measure in generated video. A one-sided
+biological-plausibility REJECTION test on the recovered plane is the intended
+guard and is not yet implemented.
+
+The older clicked-calibration path still exists in `calib/` and is what the
+`baseline` rows elsewhere in this file refer to.
+
 ## The pipeline
 
 ```
@@ -320,10 +351,273 @@ also multiplies the FK noise, so the optimizer shrinks the animal to shrink
 the noise: a stable −8…−25% (errors-in-variables attenuation, worsened by the
 Huber knee). Estimate scale outside the LS from time-averaged geometry.
 
+## Paw-measurement investigation (2026-07-31)
+
+Two results, and the second overturns the premise the first was chasing.
+
+### A point tracker cannot track these paws — rejected, with mechanism
+
+CoTracker3 (SOTA point tracking) on native-resolution 512x384 crops — the
+crop matters: its predictor resizes to 384x512, so feeding it the 1280x800
+frame discards a factor of 2.5 and would have faked a null result.
+
+In windows where the RAW PIXELS provably do not change (threshold calibrated
+on an empty floor patch, noise floor p95 = 0.13 grey levels), over 280
+paw-frames: the **mesh hallucinates 3.45 px of paw motion**, the tracker
+0.02 px. But that comparison is near-tautological, and the decisive check
+fails: during swing the tracker moves **0.05–0.28 px/frame against a true
+~1.7**. It is locked to static background, not the paw.
+
+Cause, measured not guessed: the refined-sole pixel is the lowest vertex of
+the foot, so it lands **7–21 px BELOW the nearest actual dog pixel** — on the
+floor, at the contact shadow, where texture is strong and static. A dense
+grid confirms the model itself is fine (12 of 120 points moved, max 230 px);
+only the seeds are wrong. Three seeding strategies were tried and all failed:
+mesh-sole (frozen), mesh + upward foreground search (front legs only), and
+silhouette-anchored via a temporal-median background (best visibility 0.79,
+still 0.05–0.28 px/frame in swing). A paw here is small, low-texture,
+self-occluding and motion-blurred — the hard case for point tracking.
+Generic trackers need a correct seed and continuous appearance; neither is
+available without semantic knowledge of what a paw is.
+
+### Independence beats precision — the actual specification
+
+With exact ground truth, identical solver and identical GT contacts, paw
+pixels were corrupted two ways at matched magnitude:
+
+| config (amp) | pixels | px err | root | toe | scale | traverse |
+|---|---|---|---|---|---|---|
+| h1.1_d4 (3.7) | CORRELATED (mesh) | 16.6 | 0.066 | 0.083 | −7.7% | 1.16 |
+| h1.1_d4 | independent 8 px | 9.5 | **0.033** | 0.028 | −1.1% | 1.00 |
+| h1.1_d4 | perfect | 0.0 | 0.034 | 0.026 | −1.6% | 1.02 |
+| h0.8_d6 (7.5) | CORRELATED (mesh) | 14.6 | 0.118 | 0.137 | −6.5% | **1.82** |
+| h0.8_d6 | independent 8 px | 9.5 | **0.044** | 0.040 | −2.3% | 1.07 |
+| h0.8_d6 | perfect | 0.0 | 0.046 | 0.044 | −2.7% | 1.02 |
+| h2.2_d2 (0.9) | CORRELATED (mesh) | 16.9 | 0.038 | 0.042 | +0.0% | 0.94 |
+| h2.2_d2 | independent 8 px | 9.5 | 0.030 | 0.023 | +0.3% | 0.98 |
+
+Read the rows at equal pixel error. **8 px of INDEPENDENT error is as good as
+perfect pixels; ~16 px of mesh-CORRELATED error costs 2–3x.** Sweeping
+independent noise 0→16 px moves root error only 0.034→0.039 m, so precision
+past a few px buys nothing. The benefit grows with bad geometry — at
+amplification 7.5 it fixes the traverse from +82% to +7%.
+
+Why: mesh-derived pixels agree with the mesh's own FK error, so a wrong body
+is self-consistent and the solver cannot see it. Independent pixels make the
+inconsistency observable.
+
+**This changes the roadmap item, not just its priority.** An independent 2D
+paw detector is confirmed as the right next step, but for DECORRELATION, not
+precision — and the spec is loose (~8 px), so DeepLabCut SuperAnimal-Quadruped
+zero-shot may well suffice despite its documented "not for high-precision
+use" caveat. Chasing sub-pixel tracking was the wrong target.
+
+Caveat: contacts were held at ground truth throughout, so this isolates
+placement. Better pixels should also improve contact detection, which is not
+included in these numbers.
+
+### DLC SuperAnimal-Quadruped, zero-shot — tried, does NOT beat the mesh
+
+Installed in its own env (`animer/paw/dlcenv`, subprocess boundary);
+`video2go2/paw_detect_dlc.py` + `paw_smoke_test.py`.
+
+Detection quality is fine on dogs: 39 keypoints, dog_1 95.6% coverage at 0.79
+mean confidence, dog_2 86.5% at 0.71, and the leg assignment solved
+GEOMETRICALLY against the mesh reproduced the name-based mapping exactly (no
+transposition). **cat_1 fails zero-shot** — 0.27 confidence, 48% coverage,
+and the Hungarian assignment matched "RR" to `throat_base`, i.e. no plausible
+back-right paw existed. The geometric cross-check exists to catch exactly
+that and did.
+
+End to end through the unmodified retargeter, same frames, same solver, only
+the paw pixels swapped:
+
+| clip | mesh pixels | DLC raw | DLC offset-corrected |
+|---|---|---|---|
+| dog_1 | **0.63%** clamp | 1.01% | 0.88% |
+| dog_2 | **6.74%** | 9.79% | 8.56% |
+
+DLC has a real SYSTEMATIC landmark offset — its keypoint is the paw centre,
+not the sole — of 11-25 px, and strikingly reproducible across clips
+(FR +10.3/+10.8, FL +11.2/+12.6, RR -4.4/-4.9 px on dog_1/dog_2). Removing it
+per leg recovers part of the loss but does not reach the mesh.
+
+**Why the harness prediction did not transfer.** The harness modelled
+independent noise as WHITE. Measured on real video with duplicate frames
+removed, DLC's static-window lag-1 autocorrelation is 0.85-0.89 — the same as
+the mesh's 0.86-0.89. Its errors are decorrelated from the FK fit but still
+strongly correlated IN TIME, so they do not average down over a stance run,
+which was the mechanism the 2-3x gain depended on. The "8 px independent is
+as good as perfect" result stands as stated; real detectors just do not
+produce white error.
+
+Not disproven: a FINE-TUNED detector, or one whose landmark is defined as the
+sole. Both need hand-labelled frames, which remains the only real ground
+truth for real footage.
+
+### DLC full-skeleton pose refinement — marginal, watch the traverse
+
+`video2go2/pose_refine_dlc.py`. SMPLify-style: refines AniMer's per-frame SMAL
+pose against DLC's 2D skeleton (22 correspondences), with a prior holding it
+near AniMer (DLC is 2D only, so depth must come from the prior) and temporal
+smoothing. Reprojection 24.4 -> 20.8 px over 807 frames.
+
+The SMAL-26 <-> DLC-39 correspondence was established EMPIRICALLY, not from
+names, and the names would have wired it wrong:
+
+    DLC front_*_thai -> elbow     DLC back_*_thai -> stifle (true knee)
+    DLC front_*_knee -> WRIST     DLC back_*_knee -> HOCK
+    DLC *_paw        -> paw       (12-24 px agreement with AniMer's skeleton)
+
+That agreement is an independent cross-check on both models, and it settles
+the "DLC puts paws at the knees" question: it does not — its naming is just
+anatomically loose.
+
+End to end on dog_1: clamp **0.63% -> 0.52%** (the first improvement measured
+from any of the paw/skeleton work) BUT traverse fell 4.98 -> 4.35 m against a
+baseline of 6.04 m. Per the motionless-robot trap, a clamp gain paid for with
+a shrinking trajectory is not a win. Net: not adopted; needs the landmark
+offsets solved as parameters rather than the pose absorbing them.
+
+### ZoeDepth ground plane — good ORIENTATION, does not settle SCALE
+
+`video2go2/depth_ground.py`: metric depth -> back-project with the CALIBRATED
+focal -> RANSAC plane -> compare with the clicked calibration.
+
+| clip | clicked height | ZoeDepth | ratio | normal disagreement |
+|---|---|---|---|---|
+| dog_1 | 1.101 m | 1.297 m | **+18%** | 5.2 deg |
+| cat_1 | 1.090 m | 1.248 m | **+14%** | 2.3 deg |
+| dog_2 | 1.143 m | 0.889 m | **-22%** | 3.9 deg |
+
+Plane ORIENTATION agrees to 2-5 deg — good enough that the clicked geometry
+could plausibly be replaced for shape. ABSOLUTE SCALE does not agree, and
+disagrees in DIFFERENT DIRECTIONS, so ZoeDepth is a third opinion with its own
+bias rather than an arbiter. Note dog_1 and cat_1 share a rig: the clicked
+values agree to 1 cm and ZoeDepth's agree to 5 cm, both internally consistent
+but ~15% apart from each other — so one of them carries a systematic bias in
+that corridor and this test cannot say which. dog_2 is Veo-generated, so a
+depth model there is out of domain and its -22% is the least trustworthy row.
+
+**Conclusion: cannot discard the plane calibration for metric scale.** An
+absolute ruler is still required, and the cheapest one is already in the
+scene — dog_1's floor is covered in pens and markers of standard size, lying
+flat ON the calibrated plane (so no height ambiguity, no d/h amplification).
+That measurement is now the decisive open item.
+
+### Size prior + ZoeDepth plane — the first real convergence
+
+Scale is now a 1-D MAP in log space over three estimators plus a weak
+BIOLOGICAL prior (shoulder 0.50 m, log-sigma 0.30 -> ~27-90 cm). Generic:
+no fine-tuning, no per-clip tuning, true of any dog. `--size-prior`.
+
+`depth_calib.py` builds a full calibration from ZoeDepth alone — no clicking,
+no tile-size assumption — by fitting a plane and running Zhang's
+factorisation backwards.
+
+| clip / plane | scale | shoulder | traverse | clamp | skate |
+|---|---|---|---|---|---|
+| dog_1 clicked | 1.085 | 55.2 cm | 4.37 m | 0.51% | 0.011 |
+| dog_1 **ZoeDepth** | 1.086 | 53.7 cm | 4.78 m | 1.06% | 0.016 |
+| dog_1 baseline | 1.058 | 54.7 cm | **6.50 m** | 0.06% | 0.000 |
+| dog_2 clicked | 1.191 | 62.2 cm | 8.86 m | 9.61% | 0.217 |
+| dog_2 ZoeDepth | 0.787 | **40.8 cm** | 4.29 m | 6.01% | 0.081 |
+| dog_2 baseline | 1.141 | 62.2 cm | 8.61 m | 1.78% | 0.031 |
+
+**CORRECTION — the prior is nearly inert.** An ablation (which should have
+been run before claiming anything) shows it carries 6-18% of the weight and
+moves the answer by at most 4.6%:
+
+| case | prior weight | MAP with | without | delta |
+|---|---|---|---|---|
+| dog_1 clicked | 6.2% | 1.085 | 1.092 | -0.7% |
+| dog_2 clicked | 16.7% | 1.190 | 1.243 | -4.3% |
+| dog_2 zoe | 18.2% | 0.789 | 0.754 | +4.6% |
+
+It did NOT "kill" the 161 cm floor-spread estimate — that estimator only ever
+had 1.6-4.5% weight because of the sigma=0.60 I assigned it by hand. The
+MAP is really "lateral-anchor (64-88% of the weight) plus small corrections",
+and every sigma in it is asserted by me, not measured. The prior mean of
+0.50 m was also chosen after seeing that these clips imply 54-62 cm.
+
+So this is a weighted opinion with hand-picked weights, not a measurement.
+To make it sound: calibrate each estimator's sigma from its ACTUAL error
+distribution on the 12 harness configs (which is what the harness is for),
+and replace the Gaussian pull with a ONE-SIDED barrier that only penalises
+biologically absurd sizes — the guard-rail role is the one the prior can
+actually justify.
+
+**dog_1 is now robust to the plane.** Two fully independent ground planes —
+clicked tiles vs ZoeDepth metric depth — give scale 1.085 vs 1.086 and
+shoulder 55.2 vs 53.7 cm. Traverse 4.37 vs 4.78 m, 9% apart. Both disagree
+with the baseline's 6.50 m. That is not proof, but two independent
+calibrations agreeing with each other and not with the baseline is the
+strongest evidence yet on the traverse question — and it points the other way
+from what I assumed for most of this work.
+
+**A clean demonstration that clamp/skate cannot arbitrate**: dog_2's ZoeDepth
+run scores BETTER on both (6.01% / 0.081 vs 9.61% / 0.217) while shrinking
+the dog to 41 cm and halving the traverse. Exactly the motionless-robot trap.
+Reprojection error is the only ground-truth-free metric here that punishes
+collapse rather than rewarding it, and it should be the primary number.
+
+### ZoeDepth vs clicked plane, prior disabled — the pattern
+
+| clip | clicked | ZoeDepth | disagreement | footage |
+|---|---|---|---|---|
+| dog_1 | 1.0933 (56.1 cm) | 1.0912 (54.2 cm) | **0.2%** | real |
+| cat_1 | 0.5115 (35.4 cm) | 0.5563 (38.9 cm) | **8.8%** | real |
+| dog_2 | 1.2467 (67.7 cm) | 0.7533 (40.6 cm) | **65%** | Veo-generated |
+
+ZoeDepth tracks the clicked calibration on REAL footage and diverges wildly on
+the AI-generated clip. That makes a depth-derived plane a viable default for
+real video — it removes the clicking step AND the tile-size assumption, which
+is the genericity win — provided it is guarded by a rejection test rather than
+adopted blindly. The biological size constraint is the right guard: not a
+Gaussian nudging the estimate (measured inert), but a one-sided check that
+REJECTS a plane implying an impossible animal, as dog_2's 41 cm retriever.
+
+Caveats: the two real clips are the same corridor and rig, so this is really
+n=1 scene. And cat_1's implied 35-39 cm shoulder is tall for a domestic cat
+(~25 cm typical) under BOTH calibrations, hinting that they may share a
+common over-scaling of that corridor — which only an absolute ruler (the pens
+on dog_1's floor) can settle.
+
+### dog_1.mov is 24 fps content in a 60 fps container
+
+Measured at FULL resolution inside the dog's own bounding box: 61% of
+consecutive frame pairs change by <0.05 grey levels, against 1.5-6 when the
+dog moves. 1 - 24/60 = 60%. Frames are not bit-identical (re-encoding), so a
+naive equality check misses it. Every velocity computed at 60 fps therefore
+alternates between zero and ~2.5x true, which biases contact thresholds and
+dilutes measured skate.
+
+### Smoke test (`paw_smoke_test.py`) — reusable, and two traps it exposed
+
+Judges any paw-pixel source with no ground truth: must be still where the raw
+pixels are provably still, and must MOVE where they move. It correctly
+rejects CoTracker (frozen on 3 of 4 legs) and flags the mesh's own drift.
+Two calibration traps found while building it, both of which would have
+condemned a good source:
+
+* **dog_1.mov is frame-rate converted** — ~41% of frames are duplicates of
+  their predecessor (60 fps container, ~36 fps of real content). A per-frame
+  detector returns an identical answer on an identical frame, so per-frame
+  displacement is bimodal and its MEDIAN sits in the duplicate population:
+  DLC read as 0.38 px/frame ("frozen") versus 1.8 px/frame over a 2-frame
+  stride. Measure motion over a stride. This also biases every speed-based
+  contact detector in the pipeline and is worth revisiting there.
+* **Autocorrelation cannot be read in a static window.** If the input frames
+  are near-identical, any deterministic estimator returns a near-constant
+  answer, whose autocorrelation is ~1 by construction regardless of quality.
+
 ## Not done
 
-- Independent 2D paw detector (the measurement to justify it is specified
-  above; the along-view scale ambiguity now makes it the top item).
+- Independent 2D paw detector — now SPECIFIED, not speculative (see the
+  paw-measurement section): needs ~8 px accuracy and error INDEPENDENT of the
+  mesh; sub-pixel precision is worthless. Try DeepLabCut SuperAnimal-Quadruped
+  zero-shot first, in its own env behind a subprocess boundary. A point
+  tracker was tried and rejected — do not re-attempt.
 - The along-view body-height regression at the retargeter (see above) — the
   one thing blocking the BA path from replacing the baseline outright.
 - ~~Full-AniMer runs on the harness renders~~ DONE (2026-07-29). On
